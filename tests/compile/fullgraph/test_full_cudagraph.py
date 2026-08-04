@@ -83,7 +83,6 @@ def llm_pair(request):
     with temporary_environ(env_vars):
         full = LLM(
             model=model,
-            gpu_memory_utilization=0.43,
             trust_remote_code=True,
             max_model_len=1024,
             max_num_seqs=128,
@@ -93,7 +92,6 @@ def llm_pair(request):
         )
         piecewise = LLM(
             model=model,
-            gpu_memory_utilization=0.43,
             trust_remote_code=True,
             max_model_len=1024,
             max_num_seqs=128,
