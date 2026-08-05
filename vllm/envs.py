@@ -1718,6 +1718,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         [
             "LBNHC",
             "LBHNC",
+            "LHBNC",
             "NHC",
             "HNC",
             "NHD",
