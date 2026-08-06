@@ -526,6 +526,121 @@ __global__ void masked_situ_and_mul_kernel(
   }
 }
 
+template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&, const float),
+          bool act_first, bool HAS_CLAMP>
+__global__ void masked_act_and_mul_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
+    const int* __restrict__ expert_num_tokens, const int max_num_tokens,
+    const int d, const float limit, const float alpha, const float beta) {
+  const int expert = blockIdx.y;
+  const int num_tokens = expert_num_tokens[expert];
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= d || num_tokens == 0) {
+    return;
+  }
+
+  const int64_t expert_row = static_cast<int64_t>(expert) * max_num_tokens;
+  for (int token = 0; token < num_tokens; ++token) {
+    const int64_t row = expert_row + token;
+    const scalar_t* x_ptr = input + row * 2 * d;
+    const scalar_t* y_ptr = x_ptr + d;
+    scalar_t* out_ptr = out + row * d;
+    const scalar_t x = VLLM_LDG(&x_ptr[idx]);
+    const scalar_t y = VLLM_LDG(&y_ptr[idx]);
+    out_ptr[idx] = compute<scalar_t, ACT_FN, act_first, HAS_CLAMP>(x, y, limit,
+                                                                   alpha, beta);
+  }
+}
+
+template <typename scalar_t>
+__global__ void masked_swigluoai_and_mul_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
+    const int* __restrict__ expert_num_tokens, const int max_num_tokens,
+    const int d, const float alpha, const float limit) {
+  const int expert = blockIdx.y;
+  const int num_tokens = expert_num_tokens[expert];
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= d || num_tokens == 0) {
+    return;
+  }
+
+  const int64_t expert_row = static_cast<int64_t>(expert) * max_num_tokens;
+  for (int token = 0; token < num_tokens; ++token) {
+    const int64_t row = expert_row + token;
+    const scalar_t* in_ptr = input + row * 2 * d;
+    scalar_t* out_ptr = out + row * d;
+    out_ptr[idx] =
+        swigluoai_and_mul(in_ptr[2 * idx], in_ptr[2 * idx + 1], alpha, limit);
+  }
+}
+
+template <typename scalar_t>
+__global__ void masked_swiglustep_and_mul_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
+    const int* __restrict__ expert_num_tokens, const int max_num_tokens,
+    const int d, const float limit) {
+  const int expert = blockIdx.y;
+  const int num_tokens = expert_num_tokens[expert];
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= d || num_tokens == 0) {
+    return;
+  }
+
+  const int64_t expert_row = static_cast<int64_t>(expert) * max_num_tokens;
+  for (int token = 0; token < num_tokens; ++token) {
+    const int64_t row = expert_row + token;
+    const scalar_t* gate_ptr = input + row * 2 * d;
+    const scalar_t* up_ptr = gate_ptr + d;
+    scalar_t* out_ptr = out + row * d;
+    const float gate = (float)VLLM_LDG(&gate_ptr[idx]);
+    const float up = (float)VLLM_LDG(&up_ptr[idx]);
+    const float gate_silu = gate / (1.0f + expf(-gate));
+    const float gate_clamped = fminf(gate_silu, limit);
+    const float up_clamped = fmaxf(fminf(up, limit), -limit);
+    out_ptr[idx] = (scalar_t)(gate_clamped * up_clamped);
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ T silu_no_mul_kernel(const T& x) {
+  return silu_kernel(x, 1.0f);
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_no_mul_kernel(const T& x) {
+  return gelu_kernel(x, 1.0f);
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_tanh_no_mul_kernel(const T& x) {
+  return gelu_tanh_kernel(x, 1.0f);
+}
+
+template <typename T>
+__device__ __forceinline__ T relu2_no_mul_kernel(const T& x) {
+  const float value = fmaxf((float)x, 0.0f);
+  return (T)(value * value);
+}
+
+template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&)>
+__global__ void masked_activation_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
+    const int* __restrict__ expert_num_tokens, const int max_num_tokens,
+    const int d) {
+  const int expert = blockIdx.y;
+  const int num_tokens = expert_num_tokens[expert];
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= d || num_tokens == 0) {
+    return;
+  }
+
+  const int64_t expert_row = static_cast<int64_t>(expert) * max_num_tokens;
+  for (int token = 0; token < num_tokens; ++token) {
+    const int64_t offset = (expert_row + token) * d + idx;
+    out[offset] = ACT_FN(VLLM_LDG(&input[offset]));
+  }
+}
+
 }  // namespace vllm
 
 #define LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(KERNEL, PACKED_KERNEL, PARAM) \
@@ -663,6 +778,97 @@ void masked_situ_and_mul(torch::stable::Tensor& out,    // [E, T, d]
             (float)beta, (float)linear_beta);
       });
 }
+
+#define LAUNCH_MASKED_ACT_AND_MUL(KERNEL, ACT_FIRST, HAS_CLAMP, LIMIT, ALPHA, \
+                                  BETA)                                       \
+  vllm::masked_act_and_mul_kernel<scalar_t, KERNEL<scalar_t>, ACT_FIRST,      \
+                                  HAS_CLAMP><<<grid, block, 0, stream>>>(     \
+      out.mutable_data_ptr<scalar_t>(), input.const_data_ptr<scalar_t>(),     \
+      expert_num_tokens.const_data_ptr<int>(), max_num_tokens, d, LIMIT,      \
+      ALPHA, BETA)
+
+#define LAUNCH_MASKED_ACTIVATION(KERNEL)                                      \
+  vllm::masked_activation_kernel<scalar_t, KERNEL<scalar_t>>                  \
+      <<<grid, block, 0, stream>>>(                                           \
+          out.mutable_data_ptr<scalar_t>(), input.const_data_ptr<scalar_t>(), \
+          expert_num_tokens.const_data_ptr<int>(), max_num_tokens, d)
+
+void masked_moe_activation(
+    torch::stable::Tensor& out,    // [E, T, d]
+    torch::stable::Tensor& input,  // [E, T, d] or [E, T, 2 * d]
+    const torch::stable::Tensor& expert_num_tokens,
+    const std::string& activation, double clamp_limit, double alpha,
+    double beta, double situ_beta, double situ_linear_beta) {
+  const int num_experts = input.size(0);
+  const int max_num_tokens = input.size(1);
+  const int d = out.size(2);
+  if (num_experts == 0 || max_num_tokens == 0) {
+    return;
+  }
+
+  constexpr int block_size = 256;
+  dim3 grid((d + block_size - 1) / block_size, num_experts);
+  dim3 block(block_size);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      input.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream();
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "masked_moe_activation", [&] {
+        if (activation == "silu") {
+          LAUNCH_MASKED_ACT_AND_MUL(vllm::silu_kernel, true, false, 0.0f, 1.0f,
+                                    0.0f);
+        } else if (activation == "silu_with_clamp") {
+          LAUNCH_MASKED_ACT_AND_MUL(vllm::silu_kernel, true, true,
+                                    (float)clamp_limit, (float)alpha,
+                                    (float)beta);
+        } else if (activation == "gelu") {
+          LAUNCH_MASKED_ACT_AND_MUL(vllm::gelu_kernel, true, false, 0.0f, 1.0f,
+                                    0.0f);
+        } else if (activation == "gelu_tanh") {
+          LAUNCH_MASKED_ACT_AND_MUL(vllm::gelu_tanh_kernel, true, false, 0.0f,
+                                    1.0f, 0.0f);
+        } else if (activation == "situ") {
+          vllm::masked_situ_and_mul_kernel<scalar_t>
+              <<<grid, block, 0, stream>>>(
+                  out.mutable_data_ptr<scalar_t>(),
+                  input.const_data_ptr<scalar_t>(),
+                  expert_num_tokens.const_data_ptr<int>(), max_num_tokens, d,
+                  (float)situ_beta, (float)situ_linear_beta);
+        } else if (activation == "swigluoai") {
+          vllm::masked_swigluoai_and_mul_kernel<scalar_t>
+              <<<grid, block, 0, stream>>>(
+                  out.mutable_data_ptr<scalar_t>(),
+                  input.const_data_ptr<scalar_t>(),
+                  expert_num_tokens.const_data_ptr<int>(), max_num_tokens, d,
+                  (float)alpha, (float)clamp_limit);
+        } else if (activation == "swigluoai_uninterleave") {
+          LAUNCH_MASKED_ACT_AND_MUL(vllm::silu_kernel, true, true,
+                                    (float)clamp_limit, (float)alpha,
+                                    (float)beta);
+        } else if (activation == "swiglustep") {
+          vllm::masked_swiglustep_and_mul_kernel<scalar_t>
+              <<<grid, block, 0, stream>>>(
+                  out.mutable_data_ptr<scalar_t>(),
+                  input.const_data_ptr<scalar_t>(),
+                  expert_num_tokens.const_data_ptr<int>(), max_num_tokens, d,
+                  (float)clamp_limit);
+        } else if (activation == "silu_no_mul") {
+          LAUNCH_MASKED_ACTIVATION(vllm::silu_no_mul_kernel);
+        } else if (activation == "gelu_no_mul") {
+          LAUNCH_MASKED_ACTIVATION(vllm::gelu_no_mul_kernel);
+        } else if (activation == "gelu_tanh_no_mul") {
+          LAUNCH_MASKED_ACTIVATION(vllm::gelu_tanh_no_mul_kernel);
+        } else if (activation == "relu2_no_mul") {
+          LAUNCH_MASKED_ACTIVATION(vllm::relu2_no_mul_kernel);
+        } else {
+          STD_TORCH_CHECK(false,
+                          "Unsupported masked MoE activation: ", activation);
+        }
+      });
+}
+
+#undef LAUNCH_MASKED_ACT_AND_MUL
+#undef LAUNCH_MASKED_ACTIVATION
 namespace vllm {
 
 // Element-wise activation kernel template.

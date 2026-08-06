@@ -134,9 +134,29 @@ _APPLY_MOE_ACTIVATIONS = frozenset(
 )
 
 
+_MASKED_MOE_ACTIVATION_NAMES: dict[MoEActivation, str] = {
+    MoEActivation.SILU: "silu",
+    MoEActivation.GELU: "gelu",
+    MoEActivation.GELU_TANH: "gelu_tanh",
+    MoEActivation.SITU: "situ",
+    MoEActivation.SWIGLUOAI: "swigluoai",
+    MoEActivation.SWIGLUOAI_UNINTERLEAVE: "swigluoai_uninterleave",
+    MoEActivation.SWIGLUSTEP: "swiglustep",
+    MoEActivation.SILU_NO_MUL: "silu_no_mul",
+    MoEActivation.GELU_NO_MUL: "gelu_no_mul",
+    MoEActivation.GELU_TANH_NO_MUL: "gelu_tanh_no_mul",
+    MoEActivation.RELU2_NO_MUL: "relu2_no_mul",
+}
+
+
 def apply_moe_activation_supported(activation: MoEActivation) -> bool:
     """Whether ``apply_moe_activation`` supports an activation."""
     return activation in _APPLY_MOE_ACTIVATIONS
+
+
+def apply_moe_activation_masked_supported(activation: MoEActivation) -> bool:
+    """Whether the masked ``apply_moe_activation`` path supports an activation."""
+    return activation in _MASKED_MOE_ACTIVATION_NAMES
 
 
 @dataclass(frozen=True)
@@ -177,6 +197,85 @@ class ApplyMoEActivationConfig:
 _DEFAULT_APPLY_MOE_ACTIVATION_CONFIG = ApplyMoEActivationConfig()
 
 
+def _validate_moe_activation_shapes(
+    activation: MoEActivation,
+    output: torch.Tensor,
+    input: torch.Tensor,
+    expected_dim: int,
+) -> None:
+    assert input.dim() == expected_dim, f"Input must be {expected_dim}D"
+    assert output.dim() == expected_dim, f"Output must be {expected_dim}D"
+    assert input.shape[:-1] == output.shape[:-1], (
+        f"Input/output leading shapes must match: {input.shape} vs {output.shape}"
+    )
+    if activation.is_gated:
+        assert output.size(-1) * 2 == input.size(-1), (
+            f"{activation.value} expects 2x ratio: "
+            f"{output.size(-1) * 2} vs {input.size(-1)}"
+        )
+    else:
+        assert output.size(-1) == input.size(-1), (
+            f"{activation.value} expects equal sizes: "
+            f"{output.size(-1)} vs {input.size(-1)}"
+        )
+
+
+def _apply_moe_activation_masked(
+    activation: MoEActivation,
+    output: torch.Tensor,
+    input: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    config: ApplyMoEActivationConfig,
+) -> torch.Tensor:
+    masked_activation = _MASKED_MOE_ACTIVATION_NAMES.get(activation)
+    if masked_activation is None:
+        raise NotImplementedError(
+            f"Masked MoE activation is not implemented for {activation.value}"
+        )
+
+    _validate_moe_activation_shapes(activation, output, input, expected_dim=3)
+    assert expert_num_tokens.dtype == torch.int32, (
+        "expert_num_tokens must use torch.int32"
+    )
+    assert expert_num_tokens.dim() == 1, "expert_num_tokens must be 1D"
+    assert expert_num_tokens.size(0) == input.size(0), (
+        "expert_num_tokens must have one count per expert"
+    )
+
+    masked_clamp_limit = 0.0 if config.clamp_limit is None else config.clamp_limit
+    masked_alpha = config.alpha
+    if activation == MoEActivation.SILU and config.clamp_limit is not None:
+        masked_activation = "silu_with_clamp"
+    elif activation == MoEActivation.SITU:
+        assert config.activation_situ_beta is not None, (
+            "SITU requires activation_situ_beta from FusedMoEConfig"
+        )
+    elif activation == MoEActivation.SWIGLUOAI:
+        masked_clamp_limit = 7.0
+        masked_alpha = 1.702
+    elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+        assert config.clamp_limit is not None, (
+            "SWIGLUOAI_UNINTERLEAVE requires clamp_limit"
+        )
+    elif activation == MoEActivation.SWIGLUSTEP:
+        masked_clamp_limit = 7.0
+
+    torch.ops._C.masked_moe_activation(
+        output,
+        input,
+        expert_num_tokens,
+        masked_activation,
+        masked_clamp_limit,
+        masked_alpha,
+        config.beta,
+        1.0 if config.activation_situ_beta is None else config.activation_situ_beta,
+        -1.0
+        if config.activation_situ_linear_beta is None
+        else config.activation_situ_linear_beta,
+    )
+    return output
+
+
 def silu_and_mul_with_clamp(
     output: torch.Tensor,
     input: torch.Tensor,
@@ -201,11 +300,15 @@ def apply_moe_activation(
     activation_config: ApplyMoEActivationConfig | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    expert_num_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply MoE activation function.
 
     The configuration drives specialized activation behavior. Routing tensors
-    remain per-call inputs because they depend on the current token assignment.
+    and expert token counts remain per-call inputs because they depend on the
+    current token assignment. When ``expert_num_tokens`` is provided, input and
+    output use padded ``[E, T, D]`` layouts and only each expert's valid prefix
+    is activated.
     """
     config = (
         _DEFAULT_APPLY_MOE_ACTIVATION_CONFIG
@@ -213,18 +316,16 @@ def apply_moe_activation(
         else activation_config
     )
 
-    assert input.dim() == 2, "Input must be 2D"
-    assert output.dim() == 2, "Output must be 2D"
-    if activation.is_gated:
-        assert output.size(-1) * 2 == input.size(-1), (
-            f"{activation.value} expects 2x ratio: "
-            f"{output.size(-1) * 2} vs {input.size(-1)}"
+    if expert_num_tokens is not None:
+        return _apply_moe_activation_masked(
+            activation,
+            output,
+            input,
+            expert_num_tokens,
+            config,
         )
-    else:
-        assert output.size(-1) == input.size(-1), (
-            f"{activation.value} expects equal sizes: "
-            f"{output.size(-1)} vs {input.size(-1)}"
-        )
+
+    _validate_moe_activation_shapes(activation, output, input, expected_dim=2)
 
     # Activations with gated multiplication (gate × activation(up))
     if activation == MoEActivation.SILU:

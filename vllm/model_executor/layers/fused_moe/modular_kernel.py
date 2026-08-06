@@ -891,6 +891,7 @@ class FusedMoEExpertsModular(FusedMoEExperts):
         *,
         topk_ids: torch.Tensor | None = None,
         expert_map: torch.Tensor | None = None,
+        expert_num_tokens: torch.Tensor | None = None,
     ) -> None:
         apply_moe_activation(
             activation,
@@ -899,6 +900,7 @@ class FusedMoEExpertsModular(FusedMoEExperts):
             activation_config=self.activation_config,
             topk_ids=topk_ids,
             expert_map=expert_map,
+            expert_num_tokens=expert_num_tokens,
         )
 
     @abstractmethod
